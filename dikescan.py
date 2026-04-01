@@ -930,6 +930,7 @@ class AsyncScanner:
 
             async with self._async_lock:
                 self.scanner.scanned_count += 1
+                self.scanner.scanned_urls.add(path)
                 count = self.scanner.scanned_count
 
             result = await self.scan_single_path(path)
