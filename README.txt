@@ -34,6 +34,20 @@ python scanner.py -u http://example.com
 python scanner.py -u http://example.com -t 10
 ```
 
+### 异步模式（高性能）
+
+当并发数较高时（threads > 5 或 crawl_threads > 5），自动启用异步模式，使用协程替代线程：
+
+```bash
+# 高并发自动启用异步（推荐）
+python scanner.py -u http://example.com -t 10 --crawl-threads 5
+
+# 强制启用异步模式
+python scanner.py -u http://example.com -t 10 --async
+
+# 异步模式优势：更高并发、更低CPU占用
+```
+
 ### 使用自定义字典
 
 ```bash
@@ -94,6 +108,7 @@ python scanner.py -u http://example.com --exclude-status "404"
 - **字典自动加载**: 默认扫描dict文件夹下所有txt文件
 - **爬虫增强**: 自动爬取站点路径、支持深度控制、路径提取
 - **智能处理**: 敏感路径标记、优先级扫描
+- **异步模式**: 高并发自动启用，协程驱动，更高性能更低CPU
 - **交互控制**: 优雅暂停/退出、断点续扫、实时进度
 - **定时扫描**: 定时启动、间隔循环
 - **结果处理**: 高亮展示、CSV导出、兜底保存

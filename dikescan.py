@@ -8,6 +8,8 @@ Web Path Scanner - 目录路径扫描工具
 from __future__ import annotations
 
 import argparse
+import asyncio
+import aiohttp
 import csv
 import os
 import sys
@@ -610,6 +612,380 @@ class Soft404Detector:
             return True, f"size_repeated({content_size}B)"
 
         return False, ""
+
+
+class AsyncCrawler:
+    def __init__(self, args: argparse.Namespace, scanner: 'Scanner'):
+        self.args = args
+        self.scanner = scanner
+        self.base_url = args.url
+        self.max_depth = getattr(args, 'crawl_depth', 5)
+        self.max_concurrency = getattr(args, 'crawl_threads', 5) * 4
+        self.timeout = getattr(args, 'timeout', 10)
+        self.debug = getattr(args, 'debug', False)
+
+        self.crawled: Set[str] = set()
+        self.css_js_paths: Set[str] = set()
+        self.visited: Set[str] = set()
+        self.to_crawl: asyncio.Queue = asyncio.Queue()
+        self.results: List[Tuple[Set[str], Set[str], List[Tuple[str, int]]]] = []
+        self.is_spa_detected = False
+        self.base_domain = urllib.parse.urlparse(self.base_url).netloc
+        self.base_scheme_netloc = f"{urllib.parse.urlparse(self.base_url).scheme}://{urllib.parse.urlparse(self.base_url).netloc}"
+
+        self.common_spa_routes = [
+            "/", "/home", "/index", "/login", "/register", "/signup", "/signin",
+            "/logout", "/dashboard", "/admin", "/administrator", "/manage", "/management",
+            "/settings", "/profile", "/user", "/users", "/account", "/accounts",
+            "/api", "/api/v1", "/api/v2", "/rest", "/graphql",
+            "/auth", "/oauth", "/sso", "/cas", "/ldap",
+        ]
+
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
+
+    async def init_session(self):
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrency,
+            limit_per_host=self.max_concurrency,
+            ssl=False
+        )
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"User-Agent": random.choice(DEFAULT_USER_AGENTS)}
+        )
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+
+    async def crawl_single_url(self, current_url: str, depth: int) -> Tuple[Set[str], Set[str], List[Tuple[str, int]]]:
+        local_crawled: Set[str] = set()
+        local_css_js_paths: Set[str] = set()
+        local_new_links: List[Tuple[str, int]] = []
+
+        if not self.session:
+            return local_crawled, local_css_js_paths, local_new_links
+
+        try:
+            if self.debug:
+                print(f"[D] 爬取: {current_url} (深度: {depth})")
+
+            async with self.session.get(current_url, allow_redirects=True) as resp:
+                final_url = str(resp.url)
+                local_crawled.add(final_url)
+
+                if self.debug:
+                    print(f"[D] 响应: {final_url} - 状态:{resp.status} 大小:{resp.content_length or 0}B")
+
+                if resp.status == 200:
+                    content = await resp.read()
+                    final_url_parsed = urllib.parse.urlparse(final_url)
+                    base_path_prefix = final_url_parsed.path.rsplit("/", 1)[0] if final_url_parsed.path else ""
+                    is_root_path = final_url_parsed.path == "/" or final_url_parsed.path == ""
+
+                    if depth == 0 and len(content) < 500:
+                        if not self.is_spa_detected:
+                            self.is_spa_detected = True
+                            print(f"\033[94m[*] 检测到可能是 SPA 站点 (主页响应 {len(content)}B，最终路径: {final_url_parsed.path})\033[0m")
+                            for route in self.common_spa_routes:
+                                if is_root_path:
+                                    full_route_url = self.base_scheme_netloc + route
+                                else:
+                                    full_route_url = self.base_scheme_netloc + base_path_prefix + route
+                                local_new_links.append((full_route_url, 1))
+
+                    if depth < self.max_depth:
+                        text = content.decode('utf-8', errors='ignore')
+
+                        parser = LinkExtractor(final_url)
+                        parser.feed(text)
+
+                        css_links = self.scanner._extract_css_links(text, final_url)
+                        js_links = self.scanner._extract_js_links(text, final_url)
+
+                        for css_url in css_links:
+                            css_paths = await self._fetch_and_parse_css_async(css_url)
+                            local_css_js_paths.update(css_paths)
+
+                        for js_url in js_links:
+                            js_paths = await self._fetch_and_parse_js_async(js_url)
+                            local_css_js_paths.update(js_paths)
+
+                        for link in parser.links:
+                            local_new_links.append((link, depth + 1))
+
+                        parent_paths = parser.extract_parent_paths(parser.links)
+                        for parent in parent_paths:
+                            local_new_links.append((parent, depth + 1))
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if self.debug:
+                print(f"[D] 爬取失败: {current_url} - 错误: {e}")
+
+        return local_crawled, local_css_js_paths, local_new_links
+
+    async def _fetch_and_parse_css_async(self, css_url: str) -> Set[str]:
+        paths = set()
+        if not self.session:
+            return paths
+
+        try:
+            async with self.session.get(css_url) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    parser = CSSParser(css_url)
+                    paths = parser.parse(text)
+        except Exception:
+            pass
+        return paths
+
+    async def _fetch_and_parse_js_async(self, js_url: str) -> Set[str]:
+        paths = set()
+        if not self.session:
+            return paths
+
+        try:
+            async with self.session.get(js_url) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    parser = JSParser(js_url)
+                    paths = parser.parse(text)
+        except Exception:
+            pass
+        return paths
+
+    async def worker(self, worker_id: int):
+        while not GLOBAL_STATE.should_exit:
+            try:
+                current_url, depth = await asyncio.wait_for(self.to_crawl.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            async with self._lock:
+                if current_url in self.visited or depth > self.max_depth:
+                    self.to_crawl.task_done()
+                    continue
+                self.visited.add(current_url)
+
+            local_crawled, local_css_js_paths, local_new_links = await self.crawl_single_url(current_url, depth)
+
+            async with self._lock:
+                self.crawled.update(local_crawled)
+                self.css_js_paths.update(local_css_js_paths)
+
+                for new_url, new_depth in local_new_links:
+                    if new_url not in self.visited and new_depth <= self.max_depth:
+                        await self.to_crawl.put((new_url, new_depth))
+
+            self.to_crawl.task_done()
+
+    async def run_async(self):
+        await self.init_session()
+        print(f"\n\033[94m[*] 启动异步爬虫模式，深度: {self.max_depth}，并发: {self.max_concurrency}\033[0m")
+
+        await self.to_crawl.put((self.base_url, 0))
+
+        workers = [asyncio.create_task(self.worker(i)) for i in range(self.max_concurrency)]
+
+        async def monitor_progress():
+            last_count = 0
+            while not GLOBAL_STATE.should_exit:
+                await asyncio.sleep(1)
+                current_size = self.to_crawl.qsize()
+                if current_size != last_count:
+                    print(f"\r[*] 爬虫进度: 已爬取 {len(self.crawled)} 个页面, 待爬取 {current_size}", end="", flush=True)
+                    last_count = current_size
+
+        monitor_task = asyncio.create_task(monitor_progress())
+
+        await self.to_crawl.join()
+
+        for w in workers:
+            w.cancel()
+
+        await asyncio.gather(*workers, return_exceptions=True)
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
+
+        await self.close_session()
+
+        combined_paths = self.crawled | self.css_js_paths
+        print(f"\n\033[94m[*] 异步爬虫完成，共提取 {len(combined_paths)} 条路径 (爬取 {len(self.crawled)} 个页面)\033[0m")
+        return combined_paths
+
+
+class AsyncScanner:
+    def __init__(self, args: argparse.Namespace, scanner: 'Scanner'):
+        self.args = args
+        self.scanner = scanner
+        self.max_concurrency = getattr(args, 'threads', 1) * 10
+        self.timeout = getattr(args, 'timeout', 10)
+        self.delay = getattr(args, 'delay', 0.1)
+        self.debug = getattr(args, 'debug', False)
+
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.semaphore: Optional[asyncio.Semaphore] = None
+        self._async_lock = asyncio.Lock()
+
+    async def init_session(self):
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrency,
+            limit_per_host=self.max_concurrency,
+            ssl=False
+        )
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"User-Agent": random.choice(DEFAULT_USER_AGENTS)}
+        )
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+
+    async def scan_single_path(self, path: str) -> Optional[Dict]:
+        async with self.semaphore:
+            if GLOBAL_STATE.should_exit:
+                return None
+
+            while GLOBAL_STATE.paused:
+                await asyncio.sleep(0.1)
+
+            await asyncio.sleep(random.uniform(self.delay * 0.5, self.delay * 1.5))
+
+            url = path if path.startswith(("http://", "https://")) else urllib.parse.urljoin(self.args.url, path)
+
+            try:
+                async with self.session.get(url, allow_redirects=True) as resp:
+                    status = resp.status
+                    final_url = str(resp.url)
+
+                    if status == 200:
+                        content = await resp.read()
+                        title = self.scanner._extract_title(content.decode('utf-8', errors='ignore'))
+                        content_size = len(content)
+
+                        self.scanner.soft_404_detector.record_size(content_size)
+                        is_invalid, invalid_reason = self.scanner.soft_404_detector.is_invalid_content(content, final_url, title)
+                        if is_invalid:
+                            return None
+
+                        is_sensitive = self.scanner.is_sensitive_path(final_url)
+                        deduplicate = getattr(self.args, 'deduplicate', True)
+                        is_sensitive_duplicate = False
+                        if deduplicate:
+                            is_new, is_sensitive_duplicate = self.scanner.fingerprint_cache.check_and_add(status, content, final_url, is_sensitive)
+                            if not is_new:
+                                return None
+
+                        if content_size < 1024:
+                            size_str = f"{content_size}B"
+                        elif content_size < 1024 * 1024:
+                            size_str = f"{content_size/1024:.1f}KB"
+                        else:
+                            size_str = f"{content_size/1024/1024:.1f}MB"
+
+                        result = {
+                            "url": final_url,
+                            "status_code": status,
+                            "status_desc": self.scanner._get_status_desc(status),
+                            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "title": title,
+                            "is_sensitive": 1 if is_sensitive else 0,
+                            "is_sensitive_duplicate": 1 if is_sensitive_duplicate else 0,
+                            "content_size": size_str
+                        }
+                        return result
+                    elif status in (301, 302, 403):
+                        result = {
+                            "url": final_url,
+                            "status_code": status,
+                            "status_desc": self.scanner._get_status_desc(status),
+                            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "title": "",
+                            "is_sensitive": 1 if self.scanner.is_sensitive_path(final_url) else 0,
+                            "is_sensitive_duplicate": 0,
+                            "content_size": ""
+                        }
+                        return result
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            return None
+
+    async def worker(self, paths: List[str], results_queue: Optional[asyncio.Queue] = None, progress_callback=None):
+        for path in paths:
+            if GLOBAL_STATE.should_exit:
+                break
+
+            async with self._async_lock:
+                self.scanner.scanned_count += 1
+                count = self.scanner.scanned_count
+
+            result = await self.scan_single_path(path)
+
+            if result:
+                async with self._async_lock:
+                    self.scanner.results.append(result)
+                    self.scanner.found_count += 1
+                    if result["is_sensitive"] == 1:
+                        self.scanner.sensitive_count += 1
+
+                self.scanner._print_result(result)
+
+            if progress_callback:
+                progress_callback(count)
+
+            await asyncio.sleep(0)
+
+    async def run_async(self, paths: List[str]):
+        await self.init_session()
+        print(f"\n\033[94m[*] 启动异步扫描模式，并发: {self.max_concurrency}\033[0m")
+
+        self.scanner.start_time = time.time()
+        self.scanner.args.total_paths = len(paths)
+
+        total = len(paths)
+        start_time = time.time()
+        last_update = [start_time]
+        update_interval = 0.5
+
+        def progress_callback(count):
+            now = time.time()
+            if now - last_update[0] >= update_interval:
+                last_update[0] = now
+                percent = (count / total * 100) if total > 0 else 0
+                speed = count / (now - start_time) if start_time else 0
+                remaining = (total - count) / speed if speed > 0 else 0
+
+                bar_length = 30
+                filled = int(bar_length * count / total) if total > 0 else 0
+                bar = "=" * filled + "-" * (bar_length - filled)
+
+                sys.stdout.write(f"\r[{bar}] {percent:.1f}% {count}/{total} 速度:{speed:.1f}/s 剩余:{remaining:.0f}s 敏感:{self.scanner.sensitive_count} 异步")
+                sys.stdout.flush()
+
+        batch_size = self.max_concurrency * 2
+        for i in range(0, len(paths), batch_size):
+            if GLOBAL_STATE.should_exit:
+                break
+
+            batch = paths[i:i + batch_size]
+            workers = [asyncio.create_task(self.worker(batch, None, progress_callback)) for _ in range(min(self.max_concurrency, len(batch)))]
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        await self.close_session()
+        print()
 
 
 class AdaptiveThreadController:
@@ -1567,6 +1943,15 @@ class Scanner:
 
         wordlist_paths: Set[str] = set()
         crawler_paths: Optional[Set[str]] = None
+        use_async = getattr(self.args, 'async_mode', False)
+        auto_async_threshold = 5
+        if not use_async:
+            if self.args.threads > auto_async_threshold or getattr(self.args, 'crawl_threads', 5) > auto_async_threshold:
+                use_async = True
+                print(f"\n\033[94m[*] 检测到高并发设置，自动启用异步模式\033[0m")
+
+        if use_async:
+            print(f"\n\033[94m[*] 异步模式: 启用\033[0m")
 
         if self.args.mode in ("wordlist", "mixed"):
             if os.path.exists(self.args.wordlist):
@@ -1578,9 +1963,15 @@ class Scanner:
                 print(f"\033[93m[!] 字典路径不存在: {self.args.wordlist}\033[0m")
 
         if self.args.mode in ("crawl", "mixed"):
-            crawler_paths = self.crawl(normalized_url, self.args.crawl_depth)
-            crawler_paths = PathCombiner.deduplicate_paths(crawler_paths)
-            print(f"爬虫路径数: {len(crawler_paths)}")
+            if use_async:
+                async_crawler = AsyncCrawler(self.args, self)
+                crawler_paths = asyncio.run(async_crawler.run_async())
+                crawler_paths = PathCombiner.deduplicate_paths(crawler_paths)
+                print(f"爬虫路径数: {len(crawler_paths)}")
+            else:
+                crawler_paths = self.crawl(normalized_url, self.args.crawl_depth)
+                crawler_paths = PathCombiner.deduplicate_paths(crawler_paths)
+                print(f"爬虫路径数: {len(crawler_paths)}")
 
         all_paths = self.build_scan_queue(wordlist_paths, crawler_paths)
 
@@ -1601,15 +1992,23 @@ class Scanner:
             self._schedule_scan(all_paths)
             return
 
-        print(f"线程数: {self.args.threads}")
-        print(f"请求延时: {self.args.delay}秒")
-        print(f"重试次数: {self.args.retry}")
-        random_delay = getattr(self.args, 'random_delay', True)
-        print(f"随机延时: {'开启' if random_delay else '关闭'}")
         deduplicate = getattr(self.args, 'deduplicate', True)
-        print(f"去重功能: {'开启' if deduplicate else '关闭'}\n")
+        if use_async:
+            print(f"请求延时: {self.args.delay}秒")
+            print(f"去重功能: {'开启' if deduplicate else '关闭'}\n")
 
-        self._run_iterative_scan(all_paths)
+            async_scanner = AsyncScanner(self.args, self)
+            asyncio.run(async_scanner.run_async(all_paths))
+            self._finish_scan()
+        else:
+            print(f"线程数: {self.args.threads}")
+            print(f"请求延时: {self.args.delay}秒")
+            print(f"重试次数: {self.args.retry}")
+            random_delay = getattr(self.args, 'random_delay', True)
+            print(f"随机延时: {'开启' if random_delay else '关闭'}")
+            print(f"去重功能: {'开启' if deduplicate else '关闭'}\n")
+
+            self._run_iterative_scan(all_paths)
 
     def _run_scan(self, paths: List[str]):
         progress_lock = threading.Lock()
@@ -2211,6 +2610,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audit-log", default="scan_audit.log", help="审计日志文件路径 (默认: scan_audit.log)")
 
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
+    parser.add_argument("--async", dest="async_mode", action="store_true", help="启用异步模式 (高性能低CPU)")
 
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
 
