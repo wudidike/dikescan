@@ -1966,7 +1966,9 @@ class Scanner:
         if self.args.mode in ("crawl", "mixed"):
             if use_async:
                 async_crawler = AsyncCrawler(self.args, self)
-                crawler_paths = asyncio.run(async_crawler.run_async())
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                crawler_paths = loop.run_until_complete(async_crawler.run_async())
                 crawler_paths = PathCombiner.deduplicate_paths(crawler_paths)
                 print(f"爬虫路径数: {len(crawler_paths)}")
             else:
@@ -1999,7 +2001,9 @@ class Scanner:
             print(f"去重功能: {'开启' if deduplicate else '关闭'}\n")
 
             async_scanner = AsyncScanner(self.args, self)
-            asyncio.run(async_scanner.run_async(all_paths))
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(async_scanner.run_async(all_paths))
             self._finish_scan()
         else:
             print(f"线程数: {self.args.threads}")
