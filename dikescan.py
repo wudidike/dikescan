@@ -1948,8 +1948,12 @@ class Scanner:
         auto_async_threshold = 5
         if not use_async:
             if self.args.threads > auto_async_threshold or getattr(self.args, 'crawl_threads', 5) > auto_async_threshold:
-                use_async = True
-                print(f"\n\033[94m[*] 检测到高并发设置，自动启用异步模式\033[0m")
+                if sys.platform == "win32":
+                    use_async = False
+                    print(f"\n\033[93m[*] Windows环境，自动使用线程模式\033[0m")
+                else:
+                    use_async = True
+                    print(f"\n\033[94m[*] 检测到高并发设置，自动启用异步模式\033[0m")
 
         if use_async:
             print(f"\n\033[94m[*] 异步模式: 启用\033[0m")
