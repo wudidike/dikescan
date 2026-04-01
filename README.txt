@@ -22,28 +22,35 @@ python scanner.py -u http://example.com --mode wordlist
 python scanner.py -u http://example.com --mode crawl
 ```
 
-### 基本扫描
+### 基本扫描（默认1线程）
 
 ```bash
+# 默认1线程，低速扫描
 python scanner.py -u http://example.com
+
+# 关闭随机延时可提升速度
+python scanner.py -u http://example.com --no-random-delay
 ```
 
 ### 多线程扫描
 
 ```bash
+# 10线程扫描（threads > 5时Linux/Mac自动启用异步模式）
 python scanner.py -u http://example.com -t 10
+
+# 推荐配置：关闭随机延时 + 高并发
+python scanner.py -u http://example.com -t 10 --no-random-delay
 ```
 
 ### 异步模式（高性能）
 
-当并发数较高时（threads > 5 或 crawl_threads > 5），自动启用异步模式，使用协程替代线程：
+当并发数较高时（threads > 5 或 crawl_threads > 5）：
+- **Linux/Mac**：自动启用异步模式
+- **Windows**：自动使用线程模式（避免兼容性问题）
 
 ```bash
-# 高并发自动启用异步（推荐）
-python scanner.py -u http://example.com -t 10 --crawl-threads 5
-
-# 强制启用异步模式
-python scanner.py -u http://example.com -t 10 --async
+# 强制启用异步模式（Linux/Mac推荐）
+python scanner.py -u http://example.com -t 10 --crawl-threads 5 --async
 
 # 异步模式优势：更高并发、更低CPU占用
 ```
