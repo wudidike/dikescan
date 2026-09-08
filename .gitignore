@@ -16,3 +16,7 @@ temp_scan_*.csv
 
 # 备份
 *.bak
+
+# local dev/test files
+smoke_target.py
+test_dikescan.py
