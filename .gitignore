@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 扫描产物
+evidence/
+clusters/
+*.csv
+.scan_resume.json
+scan_audit.log
+temp_scan_*.csv
+
+# 本地会话数据
+.workbuddy/
+
+# 备份
+*.bak
